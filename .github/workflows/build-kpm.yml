@@ -27,60 +27,101 @@ jobs:
     - name: Checkout source code
       uses: actions/checkout@v6
 
+    - name: Show DDK layout (diagnostic)
+      run: |
+        set -uxo pipefail
+        KMI=${{ matrix.kmi }}
+        echo "KMI=$KMI"
+        ls -la /opt/ddk/src/$KMI 2>&1 | head -20
+        ls -la /opt/ddk/kdir/$KMI 2>&1 | head -20
+        cat /opt/ddk/src/$KMI/Makefile 2>/dev/null | head -5
+        echo "--- kernel source version ---"
+        head -5 /opt/ddk/src/$KMI/Makefile 2>/dev/null
+
     - name: Build kernelsu.ko with KPM enabled
       run: |
+        set -euxo pipefail
         KMI=${{ matrix.kmi }}
         WS=${{ github.workspace }}
         git config --global --add safe.directory "$WS"
         cd kernel
+
         SRC=/opt/ddk/src/$KMI
         KDIR=/opt/ddk/kdir/$KMI
         MODPOST=$SRC/scripts/mod/modpost.c
+
+        if [ ! -f "$MODPOST" ]; then
+          echo "::error::modpost.c not found at $MODPOST - DDK image layout mismatch for $KMI"
+          exit 1
+        fi
 
         echo "=== Restore modpost check_exports (src tree: $KMI) ==="
         sed -i 's,//		check_exports(mod);,		check_exports(mod);,' "$MODPOST" || true
         sed -i 's,//		s->module = exp->module;,		s->module = exp->module;,' "$MODPOST" || true
         sed -i "s/^static void __attribute__((unused)) check_exports(/static void check_exports(/" "$MODPOST" || true
         if ! grep -q "check_exports(mod);" "$MODPOST"; then
-          echo "::error::modpost patch pattern not found - ddk image layout changed for $KMI"; exit 1
+          echo "::error::modpost patch pattern not found - ddk image layout changed for $KMI"
+          echo "--- first 60 lines of modpost.c ---"
+          head -60 "$MODPOST"
+          exit 1
         fi
 
         rm -f "$KDIR/scripts/mod/modpost"
         touch "$MODPOST"
         gcc -O2 -c -I"$SRC/scripts/mod" -I"$SRC/scripts/include" -I"$KDIR/scripts/mod" -Dmain=file2alias_main "$SRC/scripts/mod/file2alias.c" -o /tmp/file2alias.o || true
-        # 6.6+ splits modpost (symcheck.c); whitelist only known-safe extras
+
         MODS="$SRC/scripts/mod"
         SRCS=""
         for extra in symcheck.c symsearch.c; do
           [ -f "$MODS/$extra" ] && SRCS="$SRCS $MODS/$extra"
         done
         echo "modpost sources: modpost.c sumversion.c$SRCS"
+
         gcc -O2 -I"$SRC/scripts/mod" -I"$SRC/scripts/include" -I"$KDIR/scripts/mod" -o "$KDIR/scripts/mod/modpost" "$MODPOST" "$MODS/sumversion.c" $SRCS /tmp/file2alias.o || true
+
         if [ ! -x "$KDIR/scripts/mod/modpost" ]; then
-          echo "::error::modpost rebuild failed for $KMI"; exit 1
+          echo "::error::modpost rebuild failed for $KMI"
+          exit 1
         fi
 
         echo "=== Building kernelsu.ko (KPM=y, $KMI) ==="
         CONFIG_KSU=m CONFIG_KPM=y KBUILD_MODPOST_WARN=1 CC=clang make
+
         echo "=== Build completed ==="
+        echo "--- files in kernel/ ---"
+        ls -la
+
+        echo "=== Sanity: kernelsu.ko must exist and be non-empty ==="
+        if [ ! -s kernelsu.ko ]; then
+          echo "::error::kernelsu.ko was NOT produced for $KMI"
+          echo "--- search for any .ko ---"
+          find . -name '*.ko' -print 2>/dev/null | head -20
+          exit 1
+        fi
+        ls -la kernelsu.ko
 
         echo "=== Sanity: __versions must be non-empty (MODVERSIONS kernels reject empty CRC tables) ==="
         if ! readelf -SW kernelsu.ko | grep -q __versions; then
-          echo "::error::no __versions section - module will fail to load on MODVERSIONS kernels"; exit 1
+          echo "::error::no __versions section - module will fail to load on MODVERSIONS kernels"
+          exit 1
         fi
 
         echo "=== UND symbols (should be kernel-exported only, no do_kpm/sukisu_*) ==="
         readelf -sW kernelsu.ko 2>/dev/null | awk '$7=="UND" && $8!="" {print $8}' | sort -u | tee /tmp/und.txt | head -50
         if grep -qE '^(do_kpm|sukisu_handle_kpm|sukisu_kpm_|sukisu_compact_)' /tmp/und.txt; then
-          echo "::error::kpm symbols still UND - link incomplete"; exit 1
+          echo "::error::kpm symbols still UND - link incomplete"
+          exit 1
         fi
         if ! nm kernelsu.ko 2>/dev/null | grep -qE 'T sukisu_kpm_load_module_path'; then
-          echo "::error::kpm.o not linked"; exit 1
+          echo "::error::kpm.o not linked"
+          exit 1
         fi
 
         OUT_DIR="$WS/out"
         mkdir -p "$OUT_DIR"
         cp kernelsu.ko "$OUT_DIR/${KMI}_kernelsu_kpm.ko"
+        test -s "$OUT_DIR/${KMI}_kernelsu_kpm.ko"
+        echo "--- out dir ---"
         ls -la "$OUT_DIR"
 
     - name: Upload artifact
@@ -88,3 +129,4 @@ jobs:
       with:
         name: kernelsu-kpm-${{ matrix.kmi }}
         path: out/${{ matrix.kmi }}_kernelsu_kpm.ko
+        if-no-files-found: error
