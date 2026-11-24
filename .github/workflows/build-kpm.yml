@@ -29,7 +29,7 @@ jobs:
 
     - name: Show DDK layout (diagnostic)
       run: |
-        # No -e here: this step only reports, and every probe is allowed to fail.
+        # Report-only: no -e, every probe may fail without killing the job.
         set -uxo pipefail
         KMI=${{ matrix.kmi }}
         echo "KMI=$KMI"
@@ -37,7 +37,7 @@ jobs:
         ls -la "/opt/ddk/kdir/$KMI" 2>&1 | sed -n '1,20p'
         echo "--- kernel source version ---"
         sed -n '1,5p' "/opt/ddk/src/$KMI/Makefile" 2>&1
-        echo "--- kdir config / symvers present? ---"
+        echo "--- kdir essentials ---"
         test -f "/opt/ddk/kdir/$KMI/.config" && echo "ok .config" || echo "MISSING .config"
         test -f "/opt/ddk/kdir/$KMI/Module.symvers" && echo "ok Module.symvers" || echo "MISSING Module.symvers"
 
@@ -45,7 +45,7 @@ jobs:
       run: |
         set -euxo pipefail
         KMI=${{ matrix.kmi }}
-        WS=${{ github.workspace }}
+        WS="${{ github.workspace }}"
         git config --global --add safe.directory "$WS"
         cd kernel
 
@@ -54,16 +54,16 @@ jobs:
         MODPOST="$SRC/scripts/mod/modpost.c"
 
         if [ ! -f "$MODPOST" ]; then
-          echo "::error::modpost.c not found at $MODPOST - DDK image layout mismatch for $KMI"
+          echo "::error::modpost.c not found at $MODPOST for $KMI"
           exit 1
         fi
 
-        echo "=== Restore modpost check_exports (src tree: $KMI) ==="
-        sed -i 's,//		\tcheck_exports(mod);,\t\tcheck_exports(mod);,' "$MODPOST" || true
-        sed -i 's,//		s->module = exp->module;,\t\ts->module = exp->module;,' "$MODPOST" || true
+        echo "=== restore modpost check_exports ($KMI) ==="
+        sed -i 's,//\t\tcheck_exports(mod);,\t\tcheck_exports(mod);,' "$MODPOST" || true
+        sed -i 's,//\t\ts->module = exp->module;,\t\ts->module = exp->module;,' "$MODPOST" || true
         sed -i 's,^static void __attribute__((unused)) check_exports(,static void check_exports(,' "$MODPOST" || true
         if ! grep -q "check_exports(mod);" "$MODPOST"; then
-          echo "::error::modpost patch pattern not found - ddk image layout changed for $KMI"
+          echo "::error::modpost patch pattern not found for $KMI"
           grep -n "check_exports" "$MODPOST" || true
           exit 1
         fi
@@ -87,47 +87,80 @@ jobs:
           exit 1
         fi
 
-        echo "=== Building kernelsu.ko (KPM=y, $KMI) ==="
+        echo "=== make start ($KMI) ==="
         CONFIG_KSU=m CONFIG_KPM=y KBUILD_MODPOST_WARN=1 CC=clang make
+        echo "=== make finished ==="
 
-        echo "=== Build finished, checking output ==="
+        echo "=== produced files ==="
         ls -la
+        find . -maxdepth 2 -name '*.ko' -print 2>/dev/null || true
 
-        if [ ! -s kernelsu.ko ]; then
-          echo "::error::kernelsu.ko was NOT produced for $KMI"
-          find . -name '*.ko' -print 2>/dev/null | sed -n '1,20p'
+        BUILT=""
+        if [ -s kernelsu.ko ]; then
+          BUILT="kernelsu.ko"
+        else
+          BUILT="$(find . -maxdepth 2 -name 'kernelsu*.ko' -print -quit 2>/dev/null || true)"
+        fi
+        if [ -z "$BUILT" ] || [ ! -s "$BUILT" ]; then
+          echo "::error::no kernelsu*.ko produced for $KMI"
           exit 1
         fi
-        ls -la kernelsu.ko
+        echo "built module: $BUILT"
+        ls -la "$BUILT"
 
-        echo "=== Sanity: __versions must be non-empty ==="
-        if ! readelf -SW kernelsu.ko | grep -q __versions; then
-          echo "::error::no __versions section - module will fail to load on MODVERSIONS kernels"
+        # No pipes into grep/q here: grep -q closes the pipe early, the producer
+        # takes SIGPIPE, and pipefail turns that into a bogus failure. Dump to a
+        # file first, then match on the file.
+        readelf -SW "$BUILT" > /tmp/elf_sec.txt 2>&1 || true
+        if ! grep -q __versions /tmp/elf_sec.txt; then
+          echo "::error::no __versions section in $BUILT - MODVERSIONS kernels will reject it"
           exit 1
         fi
 
-        echo "=== UND symbols (kernel-exported only) ==="
-        readelf -sW kernelsu.ko | awk '$7=="UND" && $8!="" {print $8}' | sort -u > /tmp/und.txt
+        echo "=== UND symbols ==="
+        readelf -sW "$BUILT" > /tmp/elf_syms.txt 2>&1 || true
+        awk '$7=="UND" && $8!="" {print $8}' /tmp/elf_syms.txt | sort -u > /tmp/und.txt
         sed -n '1,50p' /tmp/und.txt
         if grep -qE '^(do_kpm|sukisu_handle_kpm|sukisu_kpm_|sukisu_compact_)' /tmp/und.txt; then
           echo "::error::kpm symbols still UND - link incomplete"
           exit 1
         fi
-        if ! nm kernelsu.ko 2>/dev/null | grep -qE 'T sukisu_kpm_load_module_path'; then
-          echo "::error::kpm.o not linked"
+
+        nm "$BUILT" > /tmp/nm.txt 2>/dev/null || true
+        if ! grep -qE 'T sukisu_kpm_load_module_path' /tmp/nm.txt; then
+          echo "::error::kpm.o not linked into $BUILT"
           exit 1
         fi
 
         OUT_DIR="$WS/out"
         mkdir -p "$OUT_DIR"
-        cp kernelsu.ko "$OUT_DIR/${KMI}_kernelsu_kpm.ko"
+        cp "$BUILT" "$OUT_DIR/${KMI}_kernelsu_kpm.ko"
         test -s "$OUT_DIR/${KMI}_kernelsu_kpm.ko"
-        echo "--- out dir ---"
+        echo "=== out dir ==="
         ls -la "$OUT_DIR"
 
+    - name: Dump workspace (always)
+      if: always()
+      run: |
+        # Ground truth for the next round: runs even when the build failed, so a
+        # missing artifact always comes with the real story attached.
+        WS="${{ github.workspace }}"
+        echo "workspace: $WS"
+        ls -la "$WS" || true
+        echo "--- out/ ---"
+        ls -la "$WS/out" 2>&1 || true
+        echo "--- .ko anywhere under workspace ---"
+        find "$WS" -name '*.ko' -print 2>/dev/null | sed -n '1,40p' || true
+        echo "--- .ko under kernel/ ---"
+        find "$WS/kernel" -maxdepth 3 -name '*.ko' -print 2>/dev/null | sed -n '1,40p' || true
+
     - name: Upload artifact
+      if: always()
       uses: actions/upload-artifact@v7
       with:
         name: kernelsu-kpm-${{ matrix.kmi }}
-        path: out/${{ matrix.kmi }}_kernelsu_kpm.ko
-        if-no-files-found: error
+        path: |
+          out/*.ko
+          kernel/*.ko
+        if-no-files-found: warn
+        retention-days: 7
