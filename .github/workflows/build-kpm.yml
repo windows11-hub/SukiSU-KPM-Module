@@ -29,14 +29,17 @@ jobs:
 
     - name: Show DDK layout (diagnostic)
       run: |
+        # No -e here: this step only reports, and every probe is allowed to fail.
         set -uxo pipefail
         KMI=${{ matrix.kmi }}
         echo "KMI=$KMI"
-        ls -la /opt/ddk/src/$KMI 2>&1 | head -20
-        ls -la /opt/ddk/kdir/$KMI 2>&1 | head -20
-        cat /opt/ddk/src/$KMI/Makefile 2>/dev/null | head -5
+        ls -la "/opt/ddk/src/$KMI" 2>&1 | sed -n '1,20p'
+        ls -la "/opt/ddk/kdir/$KMI" 2>&1 | sed -n '1,20p'
         echo "--- kernel source version ---"
-        head -5 /opt/ddk/src/$KMI/Makefile 2>/dev/null
+        sed -n '1,5p' "/opt/ddk/src/$KMI/Makefile" 2>&1
+        echo "--- kdir config / symvers present? ---"
+        test -f "/opt/ddk/kdir/$KMI/.config" && echo "ok .config" || echo "MISSING .config"
+        test -f "/opt/ddk/kdir/$KMI/Module.symvers" && echo "ok Module.symvers" || echo "MISSING Module.symvers"
 
     - name: Build kernelsu.ko with KPM enabled
       run: |
@@ -46,9 +49,9 @@ jobs:
         git config --global --add safe.directory "$WS"
         cd kernel
 
-        SRC=/opt/ddk/src/$KMI
-        KDIR=/opt/ddk/kdir/$KMI
-        MODPOST=$SRC/scripts/mod/modpost.c
+        SRC="/opt/ddk/src/$KMI"
+        KDIR="/opt/ddk/kdir/$KMI"
+        MODPOST="$SRC/scripts/mod/modpost.c"
 
         if [ ! -f "$MODPOST" ]; then
           echo "::error::modpost.c not found at $MODPOST - DDK image layout mismatch for $KMI"
@@ -56,28 +59,28 @@ jobs:
         fi
 
         echo "=== Restore modpost check_exports (src tree: $KMI) ==="
-        sed -i 's,//		check_exports(mod);,		check_exports(mod);,' "$MODPOST" || true
-        sed -i 's,//		s->module = exp->module;,		s->module = exp->module;,' "$MODPOST" || true
-        sed -i "s/^static void __attribute__((unused)) check_exports(/static void check_exports(/" "$MODPOST" || true
+        sed -i 's,//		\tcheck_exports(mod);,\t\tcheck_exports(mod);,' "$MODPOST" || true
+        sed -i 's,//		s->module = exp->module;,\t\ts->module = exp->module;,' "$MODPOST" || true
+        sed -i 's,^static void __attribute__((unused)) check_exports(,static void check_exports(,' "$MODPOST" || true
         if ! grep -q "check_exports(mod);" "$MODPOST"; then
           echo "::error::modpost patch pattern not found - ddk image layout changed for $KMI"
-          echo "--- first 60 lines of modpost.c ---"
-          head -60 "$MODPOST"
+          grep -n "check_exports" "$MODPOST" || true
           exit 1
         fi
 
         rm -f "$KDIR/scripts/mod/modpost"
         touch "$MODPOST"
-        gcc -O2 -c -I"$SRC/scripts/mod" -I"$SRC/scripts/include" -I"$KDIR/scripts/mod" -Dmain=file2alias_main "$SRC/scripts/mod/file2alias.c" -o /tmp/file2alias.o || true
+        gcc -O2 -c -I"$SRC/scripts/mod" -I"$SRC/scripts/include" -I"$KDIR/scripts/mod" -Dmain=file2alias_main "$SRC/scripts/mod/file2alias.c" -o /tmp/file2alias.o
 
         MODS="$SRC/scripts/mod"
         SRCS=""
         for extra in symcheck.c symsearch.c; do
-          [ -f "$MODS/$extra" ] && SRCS="$SRCS $MODS/$extra"
+          if [ -f "$MODS/$extra" ]; then SRCS="$SRCS $MODS/$extra"; fi
         done
         echo "modpost sources: modpost.c sumversion.c$SRCS"
 
-        gcc -O2 -I"$SRC/scripts/mod" -I"$SRC/scripts/include" -I"$KDIR/scripts/mod" -o "$KDIR/scripts/mod/modpost" "$MODPOST" "$MODS/sumversion.c" $SRCS /tmp/file2alias.o || true
+        # shellcheck disable=SC2086
+        gcc -O2 -I"$SRC/scripts/mod" -I"$SRC/scripts/include" -I"$KDIR/scripts/mod" -o "$KDIR/scripts/mod/modpost" "$MODPOST" "$MODS/sumversion.c" $SRCS /tmp/file2alias.o
 
         if [ ! -x "$KDIR/scripts/mod/modpost" ]; then
           echo "::error::modpost rebuild failed for $KMI"
@@ -87,27 +90,25 @@ jobs:
         echo "=== Building kernelsu.ko (KPM=y, $KMI) ==="
         CONFIG_KSU=m CONFIG_KPM=y KBUILD_MODPOST_WARN=1 CC=clang make
 
-        echo "=== Build completed ==="
-        echo "--- files in kernel/ ---"
+        echo "=== Build finished, checking output ==="
         ls -la
 
-        echo "=== Sanity: kernelsu.ko must exist and be non-empty ==="
         if [ ! -s kernelsu.ko ]; then
           echo "::error::kernelsu.ko was NOT produced for $KMI"
-          echo "--- search for any .ko ---"
-          find . -name '*.ko' -print 2>/dev/null | head -20
+          find . -name '*.ko' -print 2>/dev/null | sed -n '1,20p'
           exit 1
         fi
         ls -la kernelsu.ko
 
-        echo "=== Sanity: __versions must be non-empty (MODVERSIONS kernels reject empty CRC tables) ==="
+        echo "=== Sanity: __versions must be non-empty ==="
         if ! readelf -SW kernelsu.ko | grep -q __versions; then
           echo "::error::no __versions section - module will fail to load on MODVERSIONS kernels"
           exit 1
         fi
 
-        echo "=== UND symbols (should be kernel-exported only, no do_kpm/sukisu_*) ==="
-        readelf -sW kernelsu.ko 2>/dev/null | awk '$7=="UND" && $8!="" {print $8}' | sort -u | tee /tmp/und.txt | head -50
+        echo "=== UND symbols (kernel-exported only) ==="
+        readelf -sW kernelsu.ko | awk '$7=="UND" && $8!="" {print $8}' | sort -u > /tmp/und.txt
+        sed -n '1,50p' /tmp/und.txt
         if grep -qE '^(do_kpm|sukisu_handle_kpm|sukisu_kpm_|sukisu_compact_)' /tmp/und.txt; then
           echo "::error::kpm symbols still UND - link incomplete"
           exit 1
